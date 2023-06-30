@@ -19,9 +19,25 @@ type Pool struct {
 
 	wg   sync.WaitGroup
 	quit chan struct{}
+
+	preAlloc bool //表示是否需要提前创建好Worker 默认为false
+	block    bool //在Worker满了的时候，是否阻塞等待(挂起) 默认为true
+
 }
 
-func New(cap int) *Pool {
+func WithBlock(block bool) Option {
+	return func(pool *Pool) {
+		pool.block = block
+	}
+}
+
+func WithPreAlloc(preAlloc bool) Option {
+	return func(pool *Pool) {
+		pool.preAlloc = preAlloc
+	}
+}
+
+func New(cap int, opt ...Option) *Pool {
 	if cap <= 0 {
 		cap = defaultCap
 	}
@@ -34,17 +50,46 @@ func New(cap int) *Pool {
 		active:   make(chan struct{}, cap),
 		tasks:    make(chan Task),
 		quit:     make(chan struct{}),
+		preAlloc: false,
+		block:    true,
 	}
 
-	fmt.Println("worker pool start")
+	for _, opt := range opt {
+		opt(p)
+	}
+	fmt.Printf("worker pool start(preAlloc=%t)\n", p.preAlloc)
+
+	if p.preAlloc {
+		for i := 0; i < p.capacity; i++ {
+			p.newWorker(i + 1)
+			p.active <- struct{}{}
+		}
+	}
+
 	go p.run()
 
 	return p
 }
 
-// todo 这里不就是预先分配了吗？
 func (p *Pool) run() {
-	idx := 0 //worker的唯一ID
+	idx := len(p.active) //worker的唯一ID
+
+	if !p.preAlloc {
+		// 监听是否有任务提交，如果存在，就创建一个Worker 处理任务
+	loop:
+		for t := range p.tasks {
+			p.returnTask(t)
+			select {
+			case <-p.quit:
+				return
+			case p.active <- struct{}{}:
+				idx++
+				p.newWorker(idx)
+			default:
+				break loop
+			}
+		}
+	}
 
 	for {
 		select {
@@ -55,6 +100,12 @@ func (p *Pool) run() {
 			p.newWorker(idx)
 		}
 	}
+}
+
+func (p *Pool) returnTask(t Task) {
+	go func() {
+		p.tasks <- t
+	}()
 }
 
 func (p *Pool) newWorker(id int) {
@@ -86,6 +137,7 @@ func (p *Pool) newWorker(id int) {
 }
 
 var ErrWorkerPollFreed = errors.New("worker pool freed")
+var ErrNoIdleWorkerInPool = errors.New("no idle worker in pool")
 
 func (p *Pool) Schedule(t Task) error {
 	select {
@@ -93,6 +145,12 @@ func (p *Pool) Schedule(t Task) error {
 		return ErrWorkerPollFreed
 	case p.tasks <- t:
 		return nil
+	default:
+		if p.block {
+			p.tasks <- t
+			return nil
+		}
+		return ErrNoIdleWorkerInPool
 	}
 }
 
@@ -101,3 +159,5 @@ func (p *Pool) Free() {
 	p.wg.Wait()
 	fmt.Printf("workpool freed\n")
 }
+
+type Option func(pool *Pool)
